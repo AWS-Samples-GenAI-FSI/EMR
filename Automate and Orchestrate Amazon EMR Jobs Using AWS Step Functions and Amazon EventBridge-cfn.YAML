@@ -1,0 +1,549 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Step Functions project for running Citibike analysis on Amazon EMR.
+
+Resources:
+  # S3 Buckets
+  InputS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EMRLogS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  OutputS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Lambda Function for S3 Object Creation
+  CreateS3ObjectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              try:
+                  logger.info('Received event: %s', event)
+                  
+                  if event['RequestType'] in ['Create', 'Update']:
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['Bucket']
+                      key = event['ResourceProperties']['Key']
+                      content = event['ResourceProperties'].get('Content', '')
+                      
+                      # For empty content (creating directory), use specific put_object params
+                      if not content:
+                          logger.info(f"Creating directory prefix: {key}")
+                          s3.put_object(
+                              Bucket=bucket,
+                              Key=key
+                          )
+                      else:
+                          logger.info(f"Creating file with content: {key}")
+                          s3.put_object(
+                              Bucket=bucket,
+                              Key=key,
+                              Body=content
+                          )
+                      
+                      response_data = {
+                          'BucketName': bucket,
+                          'ObjectKey': key
+                      }
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+                  elif event['RequestType'] == 'Delete':
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['Bucket']
+                      key = event['ResourceProperties']['Key']
+                      
+                      try:
+                          s3.delete_object(
+                              Bucket=bucket,
+                              Key=key
+                          )
+                      except Exception as e:
+                          logger.info('Error deleting object: %s', e)
+                          
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  logger.error('Error: %s', e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Timeout: 30
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub "arn:aws:s3:::${EMRLogS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${InputS3Bucket}/*"
+
+  # Create raw/ prefix in Input bucket
+  InputS3BucketRawPrefix:
+    Type: Custom::S3PutObject
+    DependsOn: 
+      - InputS3Bucket
+      - CreateS3ObjectFunction
+    Properties:
+      ServiceToken: !GetAtt CreateS3ObjectFunction.Arn
+      Bucket: !Ref InputS3Bucket
+      Key: raw/
+      Content: ""
+
+  # EMR Roles and Instance Profile
+  EMRServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticmapreduce.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole
+
+  EMREc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${EMRLogS3Bucket}"
+                  - !Sub "arn:aws:s3:::${EMRLogS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${OutputS3Bucket}"
+                  - !Sub "arn:aws:s3:::${OutputS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${InputS3Bucket}"
+                  - !Sub "arn:aws:s3:::${InputS3Bucket}/*"
+
+  EMREc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EMREc2Role
+
+  # Step Functions Role
+  EMRJobManagerStateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsEMRPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticmapreduce:RunJobFlow
+                  - elasticmapreduce:DescribeCluster
+                  - elasticmapreduce:TerminateJobFlows
+                  - elasticmapreduce:AddJobFlowSteps
+                  - elasticmapreduce:DescribeStep
+                  - elasticmapreduce:CancelSteps
+                Resource: !Sub "arn:aws:elasticmapreduce:${AWS::Region}:${AWS::AccountId}:cluster/*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: 
+                  - !GetAtt EMRServiceRole.Arn
+                  - !GetAtt EMREc2Role.Arn
+
+  # PySpark Script Upload
+  CitiBikeProcessorScript:
+    Type: Custom::S3PutObject
+    DependsOn:
+      - EMRLogS3Bucket
+      - CreateS3ObjectFunction
+    Properties:
+      ServiceToken: !GetAtt CreateS3ObjectFunction.Arn
+      Bucket: !Ref EMRLogS3Bucket
+      Key: scripts/citibike_processor.py
+      Content: |
+        from pyspark.sql import SparkSession
+        from pyspark.sql.functions import unix_timestamp, col, round, count, avg, when, hour
+        import argparse
+
+        def process_citibike_data(input_path, output_path):
+            spark = SparkSession.builder.appName("CitiBikeProcessor").getOrCreate()
+            
+            # Read input data with the correct timestamp format
+            df = spark.read.option("timestampFormat", "yyyy-MM-dd HH:mm:ss.SSS").csv(input_path, header=True, inferSchema=True)
+            
+            # Calculate trip duration in minutes
+            df = df.withColumn(
+                "trip_duration_minutes",
+                round((unix_timestamp(col("ended_at")) - unix_timestamp(col("started_at"))) / 60, 2)
+            )
+            
+            # Add hour of day
+            df = df.withColumn("start_hour", hour(col("started_at")))
+            
+            df.createOrReplaceTempView("trips")
+            
+            # Enhanced analysis with simplified SQL
+            result = spark.sql("""
+                SELECT
+                    COUNT(*) as total_trips,
+                    ROUND(AVG(trip_duration_minutes), 2) as avg_duration_minutes,
+                    ROUND(MAX(trip_duration_minutes), 2) as max_duration_minutes,
+                    ROUND(MIN(trip_duration_minutes), 2) as min_duration_minutes,
+                    
+                    -- Member vs Casual analysis
+                    COUNT(CASE WHEN member_casual = "member" THEN 1 END) as member_trips,
+                    COUNT(CASE WHEN member_casual = "casual" THEN 1 END) as casual_trips,
+                    ROUND(AVG(CASE WHEN member_casual = "member" THEN trip_duration_minutes END), 2) as avg_member_duration_mins,
+                    ROUND(AVG(CASE WHEN member_casual = "casual" THEN trip_duration_minutes END), 2) as avg_casual_duration_mins,
+                    
+                    -- Bike type analysis
+                    COUNT(CASE WHEN rideable_type = "classic_bike" THEN 1 END) as classic_bike_trips,
+                    COUNT(CASE WHEN rideable_type = "electric_bike" THEN 1 END) as electric_bike_trips,
+                    
+                    -- Rush hour analysis
+                    COUNT(CASE WHEN start_hour BETWEEN 7 AND 9 THEN 1 END) as morning_rush_trips,
+                    COUNT(CASE WHEN start_hour BETWEEN 16 AND 18 THEN 1 END) as evening_rush_trips
+                FROM trips
+                WHERE trip_duration_minutes > 0 AND trip_duration_minutes < 1440
+            """)
+            
+            # Write results as a readable CSV with headers
+            result.coalesce(1).write.mode("overwrite").option("header", "true").csv(output_path)
+
+        if __name__ == "__main__":
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--input", required=True)
+            parser.add_argument("--output", required=True)
+            args = parser.parse_args()
+            
+            process_citibike_data(args.input, args.output)
+
+  # Step Functions State Machine
+  CitiBikeAnalysisStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: 
+      - EMRServiceRole
+      - EMREc2InstanceProfile
+      - CitiBikeProcessorScript
+    Properties:
+      RoleArn: !GetAtt EMRJobManagerStateMachineExecutionRole.Arn
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "Comment": "State machine to create an EMR cluster, run Citibike analysis, check status, and terminate the cluster",
+              "StartAt": "ValidateInput",
+              "States": {
+                "ValidateInput": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "And": [
+                        {
+                          "Variable": "$.LogUri",
+                          "StringMatches": "s3://${EMRLogS3Bucket}/*"
+                        },
+                        {
+                          "Variable": "$.OutputS3Location",
+                          "StringMatches": "s3://${OutputS3Bucket}/*"
+                        }
+                      ],
+                      "Next": "CreateEMRCluster"
+                    }
+                  ],
+                  "Default": "ValidationFailed"
+                },
+                "ValidationFailed": {
+                  "Type": "Fail",
+                  "Cause": "Input validation failed - S3 paths must use designated buckets",
+                  "Error": "InvalidInput"
+                },
+                "CreateEMRCluster": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::elasticmapreduce:createCluster.sync",
+                  "Parameters": {
+                    "Name": "CitiBikeCluster",
+                    "VisibleToAllUsers": false,
+                    "ReleaseLabel": "emr-6.15.0",
+                    "Applications": [
+                      {
+                        "Name": "Spark"
+                      }
+                    ],
+                    "ServiceRole": "${EMRServiceRole}",
+                    "JobFlowRole": "${EMREc2InstanceProfile}",
+                    "LogUri.$": "$.LogUri",
+                    "Instances": {
+                      "KeepJobFlowAliveWhenNoSteps": true,
+                      "InstanceFleets": [
+                        {
+                          "Name": "MyMasterFleet",
+                          "InstanceFleetType": "MASTER",
+                          "TargetOnDemandCapacity": 1,
+                          "InstanceTypeConfigs": [
+                            {
+                              "InstanceType": "m5.xlarge"
+                            }
+                          ]
+                        },
+                        {
+                          "Name": "MyCoreFleet",
+                          "InstanceFleetType": "CORE",
+                          "TargetOnDemandCapacity": 1,
+                          "InstanceTypeConfigs": [
+                            {
+                              "InstanceType": "m5.xlarge"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "ResultPath": "$.CreateClusterResult",
+                  "Next": "SubmitSparkJob",
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "ResultPath": "$.error",
+                      "Next": "CleanupOnError"
+                    }
+                  ]
+                },
+                "CleanupOnError": {
+                  "Type": "Pass",
+                  "End": true
+                },
+                "SubmitSparkJob": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::elasticmapreduce:addStep.sync",
+                  "Parameters": {
+                    "ClusterId.$": "$.CreateClusterResult.ClusterId",
+                    "Step": {
+                      "Name": "CitiBikeProcessor",
+                      "ActionOnFailure": "CONTINUE",
+                      "HadoopJarStep": {
+                        "Jar": "command-runner.jar",
+                        "Args": [
+                          "spark-submit",
+                          "--deploy-mode", "cluster",
+                          "--conf", "spark.sql.legacy.timeParserPolicy=LEGACY",
+                          "--conf", "spark.sql.legacy.parquet.datetimeRebaseModeInWrite=LEGACY",
+                          "s3://${EMRLogS3Bucket}/scripts/citibike_processor.py",
+                          "--input", "s3://${InputS3Bucket}/raw/202402-citibike-tripdata.csv",
+                          "--output", "s3://${OutputS3Bucket}/processed/"
+                        ]
+                      }
+                    }
+                  },
+                  "ResultPath": "$.SubmitSparkJobResult",
+                  "Next": "CheckJobStatus",
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "ResultPath": "$.error",
+                      "Next": "TerminateCluster"
+                    }
+                  ]
+                },
+                "CheckJobStatus": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.SubmitSparkJobResult.Step.Status.State",
+                      "StringEquals": "COMPLETED",
+                      "Next": "RecordJobSuccess"
+                    },
+                    {
+                      "Variable": "$.SubmitSparkJobResult.Step.Status.State",
+                      "StringEquals": "FAILED",
+                      "Next": "RecordJobFailure"
+                    },
+                    {
+                      "Variable": "$.SubmitSparkJobResult.Step.Status.State",
+                      "StringEquals": "CANCELLED",
+                      "Next": "RecordJobFailure"
+                    }
+                  ],
+                  "Default": "RecordJobFailure"
+                },
+                "RecordJobSuccess": {
+                  "Type": "Pass",
+                  "Parameters": {
+                    "message": "Citibike Job completed successfully"
+                  },
+                  "ResultPath": "$.JobStatusMessage",
+                  "Next": "TerminateCluster"
+                },
+                "RecordJobFailure": {
+                  "Type": "Pass",
+                  "Parameters": {
+                    "message": "Citibike Job failed or was cancelled"
+                  },
+                  "ResultPath": "$.JobStatusMessage",
+                  "Next": "TerminateCluster"
+                },
+                "TerminateCluster": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::elasticmapreduce:terminateCluster.sync",
+                  "Parameters": {
+                    "ClusterId.$": "$.CreateClusterResult.ClusterId"
+                  },
+                  "ResultPath": "$.TerminateClusterResult",
+                  "End": true
+                }
+              }
+            }
+          - EMRServiceRole: !GetAtt EMRServiceRole.Arn
+            EMREc2InstanceProfile: !Ref EMREc2InstanceProfile
+            EMRLogS3Bucket: !Ref EMRLogS3Bucket
+            OutputS3Bucket: !Ref OutputS3Bucket
+            InputS3Bucket: !Ref InputS3Bucket
+
+  # EventBridge Scheduler
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionStartExecution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt CitiBikeAnalysisStateMachine.Arn
+
+  OneTimeSchedule:
+    Type: AWS::Scheduler::Schedule
+    DependsOn: 
+      - CitiBikeAnalysisStateMachine
+      - SchedulerExecutionRole
+    Properties:
+      Name: !Sub "${AWS::StackName}-CitiBikeAnalysis"
+      Description: "One-time schedule for CitiBike data processing on Dec 31, 2025"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: "at(2025-12-31T09:00:00)"
+      ScheduleExpressionTimezone: "America/New_York"
+      State: "ENABLED"
+      Target:
+        Arn: !GetAtt CitiBikeAnalysisStateMachine.Arn
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        Input: !Sub |
+          {
+            "LogUri": "s3://${EMRLogS3Bucket}/logs/",
+            "OutputS3Location": "s3://${OutputS3Bucket}/processed/"
+          }
+
+# Outputs
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !GetAtt CitiBikeAnalysisStateMachine.Arn
+  
+  LogBucketName:
+    Description: S3 bucket for EMR logs
+    Value: !Ref EMRLogS3Bucket
+  
+  InputBucketName:
+    Description: S3 bucket for CitiBike input data
+    Value: !Ref InputS3Bucket
+
+  OutputBucketName:
+    Description: S3 bucket for CitiBike analysis output
+    Value: !Ref OutputS3Bucket
+  
+  SchedulerArn:
+    Description: ARN of the EventBridge Scheduler
+    Value: !GetAtt OneTimeSchedule.Arn
